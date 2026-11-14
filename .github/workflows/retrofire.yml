@@ -20,17 +20,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # the build the Fire TV gets
+          # Plain -O2 as upstream. Measured on the Fire TV Stick 4K Max (Death Rally, fixed cycles):
+          # -O3 -mcpu=cortex-a55 is no faster with the dynamic core and 9% slower with the normal
+          # one, adding -flto is 13% slower with the dynamic core.
           - name: android
             flags: ""
             ldflags: ""
-          # experiments, to compare speed on the Fire TV (not installed by rf)
-          - name: test-o3-a55
-            flags: "-O3 -mcpu=cortex-a55"
-            ldflags: ""
-          - name: test-o3-a55-lto
-            flags: "-O3 -mcpu=cortex-a55 -flto"
-            ldflags: "-flto -O3"
     steps:
       - uses: actions/checkout@v4
       - name: Build with ndk-build
