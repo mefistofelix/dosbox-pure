@@ -1814,7 +1814,8 @@ struct NE2K
 					dhcp_clientmac[6], dhcp_clientmacpadding[10], dhcp_srvname[64], dhcp_bootfile[128], dhcp_cookie[4], dhcp_opt1[3];
 			};
 			const DHCPPacket& inp = *(const DHCPPacket*)&s.mem[s.tx_page_start*256 - BX_NE2K_MEMSTART];
-			if (s.tx_bytes >= sizeof(DHCPPacket)
+			// (not with the internet gateway, which has its own DHCP server and network)
+			if (!(dbp_net_internet && !dbp_net_connected) && s.tx_bytes >= sizeof(DHCPPacket)
 				&& inp.dhcp_cookie[0] == 0x63 && inp.dhcp_cookie[1] == 0x82 && inp.dhcp_cookie[2] == 0x53 && inp.dhcp_cookie[3] == 0x63 && inp.dhcp_bootmsgtype == 1
 				&& inp.eth_dest_mac[0] == 0xFF && inp.eth_type_and_length[0] == 0x8 && inp.ip_protocol == 17 && inp.udp_srcport[1] == 68 && inp.udp_destport[1] == 67
 				&& s.DCR.loop != 0 && s.TCR.loop_cntl == 0) // don't receive in loopback modes

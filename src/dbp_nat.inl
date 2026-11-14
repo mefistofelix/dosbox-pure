@@ -262,24 +262,30 @@ struct DBP_NAT
 	{
 		if (len < 240 || b[0] != 1 || R32(b + 236) != 0x63825363) return;
 		Bit8u msg = 0;
+		Bit32u wanted = R32(b + 12); // the address the client says it has
 		for (Bit32u i = 240; i + 1 < len && b[i] != 255; )
 		{
 			if (b[i] == 0) { i++; continue; }
 			if (b[i] == 53 && b[i + 1] >= 1 && i + 2 < len) msg = b[i + 2];
+			if (b[i] == 50 && b[i + 1] == 4 && i + 5 < len) wanted = R32(b + i + 2); // requested address
 			i += 2u + b[i + 1];
 		}
 		if (msg != 1 && msg != 3) return; // discover -> offer, request -> ack
+		// a lease from somewhere else (the core's netplay DHCP gives 192.168.x.x): refuse it, the
+		// client then asks again from scratch
+		const bool nak = (msg == 3 && wanted && wanted != GUEST());
 		Bit8u r[300]; memset(r, 0, sizeof(r));
 		r[0] = 2; r[1] = 1; r[2] = 6;
 		memcpy(r + 4, b + 4, 4);         // transaction id
 		memcpy(r + 10, b + 10, 2);       // flags
-		W32(r + 16, GUEST());            // your address
+		if (!nak) W32(r + 16, GUEST());  // your address
 		W32(r + 20, GW());               // server
 		memcpy(r + 28, b + 28, 16);      // client hardware address
 		W32(r + 236, 0x63825363);
 		Bit8u* o = r + 240;
-		*o++ = 53; *o++ = 1; *o++ = (Bit8u)(msg == 1 ? 2 : 5);
+		*o++ = 53; *o++ = 1; *o++ = (Bit8u)(nak ? 6 : (msg == 1 ? 2 : 5));
 		*o++ = 54; *o++ = 4; W32(o, GW()); o += 4;
+		if (nak) { *o++ = 255; SendUdp(GW(), 67, 0xFFFFFFFF, 68, r, sizeof(r), true); return; }
 		*o++ = 51; *o++ = 4; W32(o, 86400 * 30); o += 4;
 		*o++ = 1; *o++ = 4; W32(o, 0xFFFFFF00); o += 4;
 		*o++ = 3; *o++ = 4; W32(o, GW()); o += 4;
