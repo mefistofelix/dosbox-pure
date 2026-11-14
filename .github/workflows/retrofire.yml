@@ -16,20 +16,40 @@ concurrency:
 jobs:
   android:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # the build the Fire TV gets
+          - name: android
+            flags: ""
+            ldflags: ""
+          # experiments, to compare speed on the Fire TV (not installed by rf)
+          - name: test-o3-a55
+            flags: "-O3 -mcpu=cortex-a55"
+            ldflags: ""
+          - name: test-o3-a55-lto
+            flags: "-O3 -mcpu=cortex-a55 -flto"
+            ldflags: "-flto -O3"
     steps:
       - uses: actions/checkout@v4
       - name: Build with ndk-build
         working-directory: jni
         run: |
-          "$ANDROID_NDK_LATEST_HOME/ndk-build" -j"$(nproc)" APP_ABI=armeabi-v7a
+          "$ANDROID_NDK_LATEST_HOME/ndk-build" -j"$(nproc)" APP_ABI=armeabi-v7a APP_CFLAGS="${{ matrix.flags }}" APP_LDFLAGS="${{ matrix.ldflags }}"
       - name: Package
         run: |
           mkdir -p out
-          cp libs/armeabi-v7a/libretro.so out/dosbox_pure_libretro_android.so
-          cd out && zip -9 dosbox_pure_libretro_android-armeabi-v7a.so.zip dosbox_pure_libretro_android.so
+          if [ "${{ matrix.name }}" = android ]; then
+            cp libs/armeabi-v7a/libretro.so out/dosbox_pure_libretro_android.so
+            cd out && zip -9 dosbox_pure_libretro_android-armeabi-v7a.so.zip dosbox_pure_libretro_android.so
+          else
+            cp libs/armeabi-v7a/libretro.so out/dosbox_pure_${{ matrix.name }}.so
+            cd out && zip -9 dosbox_pure_${{ matrix.name }}.so.zip dosbox_pure_${{ matrix.name }}.so
+          fi
       - uses: actions/upload-artifact@v4
         with:
-          name: android
+          name: ${{ matrix.name }}
           path: out/*.zip
 
   windows:
