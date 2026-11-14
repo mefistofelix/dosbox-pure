@@ -3000,7 +3000,7 @@ static void IDE_DelayedCommand(Bitu dev_idx/*which IDE device*/) {
 				/* NTS: The sector advance + count decrement is done in the I/O completion function */
 				dev->state = IDE_DEV_DATA_READ;
 				dev->status = IDE_STATUS_DRQ|IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
-				ata->prepare_read(512);
+				ata->prepare_read(0,512);
 				dev->raise_irq();
 				break;
 
@@ -3147,7 +3147,7 @@ static void IDE_DelayedCommand(Bitu dev_idx/*which IDE device*/) {
 				/* NTS: The sector advance + count decrement is done in the I/O completion function */
 				dev->state = IDE_DEV_DATA_READ;
 				dev->status = IDE_STATUS_DRQ|IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
-				ata->prepare_read(512*IDEMIN((Bitu)ata->multiple_sector_count,(Bitu)sectcount));
+				ata->prepare_read(0,512*IDEMIN((Bitu)ata->multiple_sector_count,(Bitu)sectcount));
 				dev->raise_irq();
 				break;
 
@@ -3239,7 +3239,7 @@ static void IDE_DelayedCommand(Bitu dev_idx/*which IDE device*/) {
 				dev->state = IDE_DEV_DATA_READ;
 				dev->status = IDE_STATUS_DRQ|IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
 				ata->generate_identify_device();
-				ata->prepare_read(512);
+				ata->prepare_read(0,512);
 				dev->count = 0x01;
 				dev->lba[0] = 0x00;
 				dev->feature = 0x00;
