@@ -1,0 +1,71 @@
+name: RetroFire cores
+
+# Builds the core with the internet gateway (src/dbp_nat.inl) for the Fire TV (32-bit
+# RetroArch: armeabi-v7a) and for RetroArch on Windows x64 (used to test it on the PC).
+# Every successful build is published as the rolling pre-release "build-<branch>".
+
+on:
+  push:
+    branches: ["internet"]
+  workflow_dispatch:
+
+concurrency:
+  group: retrofire-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with ndk-build
+        working-directory: jni
+        run: |
+          "$ANDROID_NDK_LATEST_HOME/ndk-build" -j"$(nproc)" APP_ABI=armeabi-v7a
+      - name: Package
+        run: |
+          mkdir -p out
+          cp libs/armeabi-v7a/libretro.so out/dosbox_pure_libretro_android.so
+          cd out && zip -9 dosbox_pure_libretro_android-armeabi-v7a.so.zip dosbox_pure_libretro_android.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: out/*.zip
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build
+        run: MSBuild.exe dosbox_pure_libretro.vcxproj /p:Configuration=Release /p:Platform=x64 /m
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p out
+          cd build/Release_64bit && 7z a ../../out/dosbox_pure_libretro-windows-x64.dll.zip dosbox_pure_libretro.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*.zip
+
+  release:
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        run: |
+          tag="build-$(echo "$GITHUB_REF_NAME" | tr '/' '-')"
+          gh release delete "$tag" --yes --cleanup-tag || true
+          gh release create "$tag" dist/*.zip --prerelease --target "$GITHUB_SHA" \
+            --title "$GITHUB_REF_NAME build $(echo "$GITHUB_SHA" | cut -c1-7)" \
+            --notes "Automatic build of $GITHUB_REF_NAME at $GITHUB_SHA."

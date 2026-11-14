@@ -105,6 +105,7 @@ namespace DBP_Option
 		// System
 		memory_size,
 		modem,
+		internet,
 		cpu_type,
 		cpu_core,
 		bootos_ramdisk,
@@ -893,6 +894,18 @@ static retro_core_option_v2_definition option_defs[DBP_Option::_OPTIONS_TOTAL] =
 			{ "dial", "Dial-Up Modem (Hayes Standard)" },
 		},
 		"null"
+	},
+	{
+		"dosbox_pure_internet",
+		"Internet Access for the Network Card", NULL,
+		"Connect the emulated NE2000 network card (port 0x300, IRQ 10) of a booted operating system to the internet through this device." "\n"
+		"The system gets its address by DHCP (10.0.2.15, router 10.0.2.2, name server 10.0.2.3). Not used during netplay.", NULL,
+		DBP_OptionCat::System,
+		{
+			{ "false", "Off (default)" },
+			{ "true", "On" },
+		},
+		"false"
 	},
 	{
 		"dosbox_pure_cpu_type",

@@ -26,6 +26,11 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  */
 
+#ifdef _WIN32 // sockets of the internet gateway (dbp_nat.inl); must come before windows.h
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 #include "dosbox.h"
 #include "regs.h"
 #include "setup.h"
@@ -1447,6 +1452,8 @@ bool CLibretroDualModem::NM_DoReceive()
 #define BX_PANIC(...) {}
 #endif
 
+#include "dbp_nat.inl"
+
 struct EthernetHeader { Bit8u dest_mac[6], src_mac[6], type_and_length[2]; };
 
 struct NE2K
@@ -1772,6 +1779,10 @@ struct NE2K
 				p[2] = DBP_Net::PKT_NE2K;
 				memcpy(p + 3, &s.mem[s.tx_page_start*256 - BX_NE2K_MEMSTART], s.tx_bytes);
 				dbp_net->OutgoingMtx.Unlock();
+			}
+			else if (dbp_net_internet) {
+				// no netplay session: the frame goes to the internet gateway
+				DBP_NAT_FromGuest(&s.mem[s.tx_page_start*256 - BX_NE2K_MEMSTART], s.tx_bytes);
 			}
 
 			// Trigger any pending timers
@@ -2709,9 +2720,21 @@ struct NE2K
 		self->tx_timer();
 	}
 
+	static void nat_rx(const Bit8u* frame, Bit32u len)
+	{
+		// don't receive in loopback modes
+		if ((self->s.DCR.loop != 0) && (self->s.TCR.loop_cntl == 0))
+			self->rx_frame(frame, len);
+	}
+
 	static void dosbox_tick_handler(void)
 	{
-		if (!dbp_net_connected || !dbp_net->IncomingNe2k.size()) return;
+		if (!dbp_net_connected)
+		{
+			if (dbp_net_internet) DBP_NAT_Poll(nat_rx);
+			return;
+		}
+		if (!dbp_net->IncomingNe2k.size()) return;
 
 		dbp_net->IncomingMtx.Lock();
 		Bit16u len;
@@ -2757,6 +2780,7 @@ void NET_ShutdownEthernet()
 {
 	delete NE2K::self;
 	NE2K::self = NULL;
+	DBP_NAT_Shutdown();
 }
 
 #endif // C_DBP_ENABLE_LIBRETRO_NE2K

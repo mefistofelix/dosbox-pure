@@ -2428,6 +2428,9 @@ static bool check_variables()
 	DBP_Option::Apply(sec_cpu, "core", cpu_core, false, false, cpu_core_changed);
 	DBP_Option::GetAndApply(sec_cpu, "cputype", DBP_Option::cpu_type, true);
 
+	extern bool dbp_net_internet;
+	dbp_net_internet = (DBP_Option::Get(DBP_Option::internet)[0] == 't');
+
 	DBP_Option::SetDisplay(DBP_Option::modem, dbp_use_network);
 	if (dbp_use_network)
 		DBP_Option::Apply(*control->GetSection("serial"), "serial1", ((DBP_Option::Get(DBP_Option::modem)[0] == 'n') ? "libretro null" : "libretro"));
