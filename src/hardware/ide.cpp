@@ -2246,6 +2246,606 @@ struct IDEATAPICDROMDevice : public IDEDevice {
 	}
 };
 
+// (moved up: IDE_DelayedCommand below uses the class)
+static void IDE_DelayedCommand(Bitu dev_idx);
+#ifdef C_DBP_ENABLE_IDE_ATA // Disabled ATA drive support because BIOS access covers most cases
+static inline bool is_power_of_2(Bitu val) {
+	return (val != 0) && ((val&(val-1)) == 0);
+}
+
+struct IDEATADevice : public IDEDevice {
+	Bitu multiple_sector_max,multiple_sector_count;
+	Bitu heads,sects,cyls,headshr,progress_count;
+	Bitu phys_heads,phys_sects,phys_cyls;
+	Bitu sector_i,sector_total;
+	unsigned char sector[512 * 128];
+	Bit8u bios_disk_index;
+	bool geo_translate;
+
+	IDEATADevice(IDEController *c, Bit8u device_index, Bit8u bios_index)
+		: IDEDevice(c, device_index, IDE_TYPE_HDD) {
+		DBP_ASSERT(bios_index < MAX_DISK_IMAGES);
+		bios_disk_index = bios_index;
+		sector_i = sector_total = 0;
+		headshr = 0;
+		memset(sector, 0, sizeof(sector));
+		multiple_sector_max = sizeof(sector) / 512;
+		multiple_sector_count = 1;
+		geo_translate = false;
+		heads = 0;
+		sects = 0;
+		cyls = 0;
+		progress_count = 0;
+		phys_heads = 0;
+		phys_sects = 0;
+		phys_cyls = 0;
+		update_from_biosdisk();
+	}
+
+	inline imageDisk *getBIOSdisk() {
+		return imageDiskList[bios_disk_index];
+	}
+
+	virtual void writecommand(uint8_t cmd) {
+		if (!command_interruption_ok(cmd))
+			return;
+
+		/* if the drive is asleep, then writing a command wakes it up */
+		interface_wakeup();
+
+		/* FIXME: OAKCDROM.SYS is sending the hard disk command 0xA0 (ATAPI packet) for some reason. Why? */
+
+		/* drive is ready to accept command */
+		allow_writing = false;
+		command = cmd;
+		switch (cmd) {
+			case 0x00: /* NOP */
+				feature = 0x04;
+				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_ERROR;
+				raise_irq();
+				allow_writing = true;
+				break;
+			case 0x08: /* DEVICE RESET */
+				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+				drivehead &= 0x10;
+				count = 0x01; lba[0] = 0x01; feature = 0x00;
+				lba[1] = lba[2] = 0;
+				/* NTS: Testing suggests that ATA hard drives DO fire an IRQ at this stage.
+						In fact, Windows 95 won't detect hard drives that don't fire an IRQ in desponse */
+				raise_irq();
+				allow_writing = true;
+				break;
+			case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: case 0x17: /* RECALIBRATE (1xh) */
+			case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D: case 0x1E: case 0x1F:
+				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+				/* "if the command is executed in CHS mode, then ... sector number register shall be 1.
+				 *  if executed in LAB mode, then ... sector number register shall be 0" */
+				if (drivehead_is_lba(drivehead)) lba[0] = 0x00;
+				else lba[0] = 0x01;
+				drivehead &= 0x10;
+				lba[1] = lba[2] = 0;
+				feature = 0x00;
+				raise_irq();
+				allow_writing = true;
+				break;
+			case 0x20: /* READ SECTOR */
+				progress_count = 0;
+				state = IDE_DEV_BUSY;
+				status = IDE_STATUS_BUSY;
+				PIC_RemoveSpecificEvents(IDE_DelayedCommand,device_index);
+				PIC_AddEvent(IDE_DelayedCommand,(0.1f)/*ms*/,device_index);
+				break;
+			case 0x30: /* WRITE SECTOR */
+				/* the drive does NOT signal an interrupt. it sets DRQ and waits for a sector
+				 * to be transferred to it before executing the command */
+				progress_count = 0;
+				state = IDE_DEV_DATA_WRITE;
+				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRQ;
+				prepare_write(0,512);
+				break;
+			case 0x40: /* READ SECTOR VERIFY WITH RETRY */
+			case 0x41: /* READ SECTOR VERIFY WITHOUT RETRY */
+				progress_count = 0;
+				state = IDE_DEV_BUSY;
+				status = IDE_STATUS_BUSY;
+				PIC_RemoveSpecificEvents(IDE_DelayedCommand,device_index);
+				PIC_AddEvent(IDE_DelayedCommand,(0.1f)/*ms*/,device_index);
+				break;
+			case 0x91: /* INITIALIZE DEVICE PARAMETERS */
+				if ((unsigned int)count != (unsigned int)sects || (unsigned int)((drivehead&0xF)+1) != (unsigned int)heads) {
+					if (count == 0) {
+						LOG_MSG("IDE warning: OS attempted to change geometry to invalid H/S %u/%u",
+							count,(drivehead&0xF)+1);
+						abort_error();
+						allow_writing = true;
+						return;
+					}
+					else {
+						unsigned int ncyls;
+
+						ncyls = (unsigned int)(phys_cyls * phys_heads * phys_sects);
+						ncyls += (count * ((unsigned int)(drivehead&0xF)+1u)) - 1u;
+						ncyls /= count * ((unsigned int)(drivehead&0xF)+1u);
+
+						/* the OS is changing logical disk geometry, so update our head/sector count (needed for Windows ME) */
+						LOG_MSG("IDE warning: OS is changing logical geometry from C/H/S %u/%u/%u to logical H/S %u/%u/%u",
+							(int)cyls,(int)heads,(int)sects,
+							(int)ncyls,(int)((drivehead&0xF)+1),(int)count);
+						LOG_MSG("             Compatibility issues may occur if the OS tries to use INT 13 at the same time!");
+
+						cyls = ncyls;
+						sects = count;
+						heads = (drivehead&0xFu)+1u;
+					}
+				}
+
+				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+				allow_writing = true;
+				raise_irq(); // NTS: The Linux kernel will pause for up to 30 seconds waiting for this command to issue an IRQ if we don't do this
+				break;
+			case 0xC4: /* READ MULTIPLE */
+				progress_count = 0;
+				state = IDE_DEV_BUSY;
+				status = IDE_STATUS_BUSY;
+				PIC_RemoveSpecificEvents(IDE_DelayedCommand,device_index);
+				PIC_AddEvent(IDE_DelayedCommand,(0.1f)/*ms*/,device_index);
+				break;
+			case 0xC5: /* WRITE MULTIPLE */
+				/* the drive does NOT signal an interrupt. it sets DRQ and waits for a sector
+				 * to be transferred to it before executing the command */
+				progress_count = 0;
+				state = IDE_DEV_DATA_WRITE;
+				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRQ;
+				prepare_write(0UL,512UL*IDEMIN((unsigned long)multiple_sector_count,(unsigned long)(count == 0 ? 256 : count)));
+				break;
+			case 0xC6: /* SET MULTIPLE MODE */
+				/* only sector counts 1, 2, 4, 8, 16, 32, 64, and 128 are legal by standard.
+				 * NTS: There's a bug in VirtualBox that makes 0 legal too! */
+				if (count != 0 && count <= multiple_sector_max && is_power_of_2(count)) {
+					multiple_sector_count = count;
+					status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+				}
+				else {
+					feature = 0x04; /* abort error */
+					abort_error();
+				}
+				raise_irq();
+				allow_writing = true;
+				break;
+			case 0xA0:/*ATAPI PACKET*/
+				/* We're not an ATAPI packet device!
+				 * Windows 95 seems to issue this at startup to hard drives. Duh. */
+				/* fall through */
+			case 0xA1: /* IDENTIFY PACKET DEVICE */
+				/* We are not an ATAPI packet device.
+				 * Most MS-DOS drivers and Windows 95 like to issue both IDENTIFY ATA and IDENTIFY ATAPI commands.
+				 * I also gather from some contributors on the github comments that people think our "Unknown IDE/ATA command"
+				 * error message is part of some other error in the emulation. Rather than put up with that, we'll just
+				 * silently abort the command with an error. */
+				abort_normal();
+				status = IDE_STATUS_ERROR|IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE|0x20/*write fault*/;
+				drivehead &= 0x30;
+				count = 0x01;
+				lba[0] = 0x01;
+				feature = 0x04; /* abort */
+				lba[1] = 0x00;
+				lba[2] = 0x00;
+				raise_irq();
+				allow_writing = true;
+				break;
+			case 0xE7: /* FLUSH CACHE */
+				/* NTS: Windows 2000 and Windows XP like this command a lot. They REALLY REALLY like
+				 *      to issue this command a lot, especially during the install phase. This is
+				 *      here to avoid filling your log file with many repetitions of
+				 *      "Unknown IDE/ATA command E7" */
+				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+				state = IDE_DEV_READY;
+				allow_writing = true;
+				raise_irq();
+				break;
+			case 0xEC: /* IDENTIFY DEVICE */
+				state = IDE_DEV_BUSY;
+				status = IDE_STATUS_BUSY;
+				PIC_RemoveSpecificEvents(IDE_DelayedCommand,device_index);
+				PIC_AddEvent(IDE_DelayedCommand,(ide_identify_command_delay),device_index);
+				break;
+			case 0xEF: /* SET FEATURES */
+				if (feature == 0x66/*Disable reverting to power on defaults*/ ||
+					feature == 0xCC/*Enable reverting to power on defaults*/) {
+					/* ignore */
+					status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+					state = IDE_DEV_READY;
+				}
+				else {
+					LOG_MSG("SET FEATURES %02xh SC=%02x SN=%02x CL=%02x CH=%02x",feature,count,lba[0],lba[1],lba[2]);
+					abort_error();
+				}
+				allow_writing = true;
+				raise_irq();
+				break;
+			default:
+				LOG_MSG("Unknown IDE/ATA command %02X",cmd);
+				abort_error();
+				allow_writing = true;
+				raise_irq();
+				break;
+		}
+	}
+
+	virtual Bitu data_read(Bitu iolen) { /* read from 1F0h data port from IDE device */
+		Bitu w = ~0u;
+
+		if (state != IDE_DEV_DATA_READ)
+			return 0xFFFFUL;
+
+		if (!(status & IDE_STATUS_DRQ)) {
+			LOG_MSG("IDE: Data read when DRQ=0");
+			return 0xFFFFUL;
+		}
+
+		if ((sector_i+iolen) > sector_total) {
+			LOG_MSG("ide ata warning: sector already read %lu / %lu",(unsigned long)sector_i,(unsigned long)sector_total);
+			return 0xFFFFUL;
+		}
+
+		if (iolen >= 4) {
+			w = host_readd(sector+sector_i);
+			sector_i += 4;
+		}
+		else if (iolen >= 2) {
+			w = host_readw(sector+sector_i);
+			sector_i += 2;
+		}
+		/* NTS: Some MS-DOS CD-ROM drivers like OAKCDROM.SYS use byte-wide I/O for the initial identification */
+		else if (iolen == 1) {
+			w = sector[sector_i++];
+		}
+
+		if (sector_i >= sector_total)
+			io_completion();
+
+		return w;
+	}
+
+	virtual void data_write(Bitu v,Bitu iolen) { /* write to 1F0h data port to IDE device */
+		if (state != IDE_DEV_DATA_WRITE) {
+			LOG_MSG("ide ata warning: data write when device not in data_write state");
+			return;
+		}
+		if (!(status & IDE_STATUS_DRQ)) {
+			LOG_MSG("ide ata warning: data write with drq=0");
+			return;
+		}
+		if ((sector_i+iolen) > sector_total) {
+			LOG_MSG("ide ata warning: sector already full %lu / %lu",(unsigned long)sector_i,(unsigned long)sector_total);
+			return;
+		}
+
+		if (iolen >= 4) {
+			host_writed(sector+sector_i,(Bit32u)v);
+			sector_i += 4;
+		}
+		else if (iolen >= 2) {
+			host_writew(sector+sector_i,(Bit32u)v);
+			sector_i += 2;
+		}
+		else if (iolen == 1) {
+			sector[sector_i++] = (unsigned char)v;
+		}
+
+		if (sector_i >= sector_total)
+			io_completion();
+	}
+
+	void update_from_biosdisk() {
+		imageDisk *dsk = getBIOSdisk();
+		if (dsk == NULL) {
+			LOG_MSG("WARNING: IDE update from BIOS disk failed, disk not available");
+			return;
+		}
+
+		headshr = 0;
+		geo_translate = false;
+		cyls = dsk->cylinders;
+		heads = dsk->heads;
+		sects = dsk->sectors;
+
+		/* One additional correction: The disk image is probably using BIOS-style geometry
+		   translation (such as C/H/S 1024/64/63) which is impossible given that the IDE
+		   standard only allows up to 16 heads. So we have to translate the geometry. */
+		while (heads > 16 && (heads & 1) == 0) {
+			cyls <<= 1U;
+			heads >>= 1U;
+			headshr++;
+		}
+
+		/* If we can't divide the heads down, then pick a LBA-like mapping that is good enough.
+		 * Note that if what we pick does not evenly map to the INT 13h geometry, and the partition
+		 * contained within is not an LBA type FAT16/FAT32 partition, then Windows 95's IDE driver
+		 * will ignore this device and fall back to using INT 13h. For user convenience we will
+		 * print a warning to reminder the user of exactly that. */
+		if (heads > 16) {
+			unsigned long tmp;
+
+			geo_translate = true;
+
+			tmp = (unsigned long)(heads * cyls * sects);
+			sects = 63;
+			heads = 16;
+			cyls = (tmp + ((63 * 16) - 1)) / (63 * 16);
+			LOG_MSG("WARNING: Unable to reduce heads to 16 and below");
+			LOG_MSG("If at all possible, please consider using INT 13h geometry with a head");
+			LOG_MSG("count that is easier to map to the BIOS, like 240 heads or 128 heads/track.");
+			LOG_MSG("Some OSes, such as Windows 95, will not enable their 32-bit IDE driver if");
+			LOG_MSG("a clean mapping does not exist between IDE and BIOS geometry.");
+			LOG_MSG("Mapping BIOS DISK C/H/S %u/%u/%u as IDE %u/%u/%u (non-straightforward mapping)",
+				(unsigned int)dsk->cylinders,
+				(unsigned int)dsk->heads,
+				(unsigned int)dsk->sectors,
+				(unsigned int)cyls,
+				(unsigned int)heads,
+				(unsigned int)sects);
+		}
+		else {
+			LOG_MSG("Mapping BIOS DISK C/H/S %u/%u/%u as IDE %u/%u/%u",
+				(unsigned int)dsk->cylinders,
+				(unsigned int)dsk->heads,
+				(unsigned int)dsk->sectors,
+				(unsigned int)cyls,
+				(unsigned int)heads,
+				(unsigned int)sects);
+		}
+
+		phys_heads = heads;
+		phys_sects = sects;
+		phys_cyls = cyls;
+	}
+
+	void generate_identify_device() {
+		//imageDisk *disk = getBIOSdisk();
+		unsigned char csum;
+		uint64_t ptotal;
+		uint64_t total;
+		Bitu i;
+
+		/* IN RESPONSE TO IDENTIFY DEVICE (0xEC)
+		   GENERATE 512-BYTE REPLY */
+		memset(sector,0,512);
+
+		/* total disk capacity in sectors */
+		total = sects * cyls * heads;
+		ptotal = phys_sects * phys_cyls * phys_heads;
+
+		host_writew(sector+(0*2),0x0040);   /* bit 6: 1=fixed disk */
+		host_writew(sector+(1*2),(Bit16u)phys_cyls);
+		host_writew(sector+(3*2),(Bit16u)phys_heads);
+		host_writew(sector+(4*2),(Bit16u)phys_sects * 512); /* unformatted bytes per track */
+		host_writew(sector+(5*2),512);      /* unformatted bytes per sector */
+		host_writew(sector+(6*2),(Bit16u)phys_sects);
+
+		host_writew(sector+(20*2),1);       /* ATA-1: single-ported single sector buffer */
+		host_writew(sector+(21*2),4);       /* ATA-1: ECC bytes on read/write long */
+
+		// These strings are encoded with a 2 byte invert pattern (1234 becomes 2143)
+		memcpy(sector+(10*2), "0868",                4); memset(sector+(10*2)+ 4, ' ',  20- 4); //id_serial "8086", 20 bytes, padded with space
+		memcpy(sector+(23*2), "0868",                4); memset(sector+(23*2)+ 4, ' ',   8- 4); //id_firmware_rev "8086", 8 bytes, padded with space
+		memcpy(sector+(27*2), "ODBSxoX-I EDd si k", 18); memset(sector+(27*2)+18, ' ',  40-18); //id_model "DOSBox-X IDE disk", 40 bytes, padded with space
+
+		if (multiple_sector_max != 0)
+			host_writew(sector+(47*2),(Bit16u)(0x80|multiple_sector_max)); /* <- READ/WRITE MULTIPLE MAX SECTORS */
+
+		host_writew(sector+(48*2),0x0000);  /* :0  0=we do not support doubleword (32-bit) PIO */
+		host_writew(sector+(49*2),0x0A00);  /* :13 0=Standby timer values managed by device */
+							/* :11 1=IORDY supported */
+							/* :10 0=IORDY not disabled */
+							/* :9  1=LBA supported */
+							/* :8  0=DMA not supported */
+		host_writew(sector+(50*2),0x4000);  /* FIXME: ??? */
+		host_writew(sector+(51*2),0x00F0);  /* PIO data transfer cycle timing mode */
+		host_writew(sector+(52*2),0x00F0);  /* DMA data transfer cycle timing mode */
+		host_writew(sector+(53*2),0x0007);  /* :2  1=the fields in word 88 are valid */
+							/* :1  1=the fields in word (70:64) are valid */
+							/* :0  1= ??? */
+		host_writew(sector+(54*2),(Bit16u)cyls);    /* current cylinders */
+		host_writew(sector+(55*2),(Bit16u)heads);   /* current heads */
+		host_writew(sector+(56*2),(Bit16u)sects);   /* current sectors per track */
+		host_writed(sector+(57*2),(Bit32u)total);   /* current capacity in sectors */
+
+		if (multiple_sector_count != 0)
+			host_writew(sector+(59*2),(Bit16u)(0x0100|multiple_sector_count)); /* :8  multiple sector setting is valid */
+							/* 7:0 current setting for number of log. sectors per DRQ of READ/WRITE MULTIPLE */
+
+		host_writed(sector+(60*2),(Bit32u)ptotal);  /* total user addressable sectors (LBA) */
+		host_writew(sector+(62*2),0x0000);  /* FIXME: ??? */
+		host_writew(sector+(63*2),0x0000);  /* :10 0=Multiword DMA mode 2 not selected */
+							/* TODO: Basically, we don't do DMA. Fill out this comment */
+		host_writew(sector+(64*2),0x0003);  /* 7:0 PIO modes supported (FIXME ???) */
+		host_writew(sector+(65*2),0x0000);  /* FIXME: ??? */
+		host_writew(sector+(66*2),0x0000);  /* FIXME: ??? */
+		host_writew(sector+(67*2),0x0078);  /* FIXME: ??? */
+		host_writew(sector+(68*2),0x0078);  /* FIXME: ??? */
+		host_writew(sector+(80*2),0x007E);  /* major version number. Here we say we support ATA-1 through ATA-8 */
+		host_writew(sector+(81*2),0x0022);  /* minor version */
+		host_writew(sector+(82*2),0x4208);  /* command set: NOP, DEVICE RESET[XXXXX], POWER MANAGEMENT */
+		host_writew(sector+(83*2),0x4000);  /* command set: LBA48[XXXX] */
+		host_writew(sector+(84*2),0x4000);  /* FIXME: ??? */
+		host_writew(sector+(85*2),0x4208);  /* commands in 82 enabled */
+		host_writew(sector+(86*2),0x4000);  /* commands in 83 enabled */
+		host_writew(sector+(87*2),0x4000);  /* FIXME: ??? */
+		host_writew(sector+(88*2),0x0000);  /* FIXME: ??? */
+		host_writew(sector+(93*3),0x0000);  /* FIXME: ??? */
+
+		/* ATA-8 integrity checksum */
+		sector[510] = 0xA5;
+		csum = 0; for (i=0;i < 511;i++) csum += sector[i];
+		sector[511] = 0 - csum;
+	}
+
+	void prepare_read(Bitu offset,Bitu size) {
+		/* I/O must be WORD ALIGNED */
+		DBP_ASSERT((offset&1) == 0);
+		//assert((size&1) == 0);
+
+		sector_i = offset;
+		sector_total = size;
+		DBP_ASSERT(sector_i <= sector_total);
+		DBP_ASSERT(sector_total <= sizeof(sector));
+	}
+
+	void prepare_write(Bitu offset,Bitu size) {
+		/* I/O must be WORD ALIGNED */
+		DBP_ASSERT((offset&1) == 0);
+		//assert((size&1) == 0);
+
+		sector_i = offset;
+		sector_total = size;
+		DBP_ASSERT(sector_i <= sector_total);
+		DBP_ASSERT(sector_total <= sizeof(sector));
+	}
+
+	void io_completion() {
+		/* lower DRQ */
+		status &= ~IDE_STATUS_DRQ;
+
+		/* depending on the command, either continue it or finish up */
+		switch (command) {
+			case 0x20:/* READ SECTOR */
+				/* OK, decrement count, increment address */
+				/* NTS: Remember that count == 0 means the host wanted to transfer 256 sectors */
+				progress_count++;
+				if ((count&0xFF) == 1) {
+					/* end of the transfer */
+					count = 0;
+					status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+					state = IDE_DEV_READY;
+					allow_writing = true;
+					return;
+				}
+				else if ((count&0xFF) == 0) count = 255;
+				else count--;
+
+				if (!increment_current_address()) {
+					LOG_MSG("READ advance error");
+					abort_error();
+					return;
+				}
+
+				/* cause another delay, another sector read */
+				state = IDE_DEV_BUSY;
+				status = IDE_STATUS_BUSY;
+				PIC_RemoveSpecificEvents(IDE_DelayedCommand,device_index);
+				PIC_AddEvent(IDE_DelayedCommand,0.00001f/*ms*/,device_index);
+				break;
+			case 0x30:/* WRITE SECTOR */
+				/* this is where the drive has accepted the sector, lowers DRQ, and begins executing the command */
+				state = IDE_DEV_BUSY;
+				status = IDE_STATUS_BUSY;
+				PIC_RemoveSpecificEvents(IDE_DelayedCommand,device_index);
+				PIC_AddEvent(IDE_DelayedCommand,((progress_count == 0) ? 0.1f : 0.00001f)/*ms*/,device_index);
+				break;
+			case 0xC4:/* READ MULTIPLE */
+				/* OK, decrement count, increment address */
+				/* NTS: Remember that count == 0 means the host wanted to transfer 256 sectors */
+				for (unsigned int cc=0;cc < multiple_sector_count;cc++) {
+					progress_count++;
+					if ((count&0xFF) == 1) {
+						/* end of the transfer */
+						count = 0;
+						status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+						state = IDE_DEV_READY;
+						allow_writing = true;
+						return;
+					}
+					else if ((count&0xFF) == 0) count = 255;
+					else count--;
+
+					if (!increment_current_address()) {
+						LOG_MSG("READ advance error");
+						abort_error();
+						return;
+					}
+				}
+
+				/* cause another delay, another sector read */
+				state = IDE_DEV_BUSY;
+				status = IDE_STATUS_BUSY;
+				PIC_RemoveSpecificEvents(IDE_DelayedCommand,device_index);
+				PIC_AddEvent(IDE_DelayedCommand,0.00001f/*ms*/,device_index);
+				break;
+			case 0xC5:/* WRITE MULTIPLE */
+				/* this is where the drive has accepted the sector, lowers DRQ, and begins executing the command */
+				state = IDE_DEV_BUSY;
+				status = IDE_STATUS_BUSY;
+				PIC_RemoveSpecificEvents(IDE_DelayedCommand,device_index);
+				PIC_AddEvent(IDE_DelayedCommand,((progress_count == 0) ? 0.1f : 0.00001f)/*ms*/,device_index);
+				break;
+			default: /* most commands: signal drive ready, return to ready state */
+				/* NTS: Some MS-DOS CD-ROM drivers will loop endlessly if we never set "drive seek complete"
+						because they like to hit the device with DEVICE RESET (08h) whether or not it's
+					a hard disk or CD-ROM drive */
+				count = 0;
+				drivehead &= 0xF0;
+				lba[0] = 0;
+				lba[1] = lba[2] = 0;
+				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+				state = IDE_DEV_READY;
+				allow_writing = true;
+				break;
+		}
+	}
+
+	bool increment_current_address(Bitu count=1) {
+		if (count == 0) return false;
+
+		if (drivehead_is_lba(drivehead)) {
+			/* 28-bit LBA:
+			 *    drivehead: 27:24
+			 *    lba[2]:    23:16
+			 *    lba[1]:    15:8
+			 *    lba[0]:    7:0 */
+			do {
+				if (((++lba[0])&0xFF) == 0x00) {
+					lba[0] = 0x00;
+					if (((++lba[1])&0xFF) == 0x00) {
+						lba[1] = 0x00;
+						if (((++lba[2])&0xFF) == 0x00) {
+							lba[2] = 0x00;
+							if (((++drivehead)&0xF) == 0) {
+								drivehead -= 0x10;
+								return false;
+							}
+						}
+					}
+				}
+			} while ((--count) != 0);
+		}
+		else {
+			/* C/H/S increment with rollover */
+			do {
+				/* increment sector */
+				if (((++lba[0])&0xFF) == ((sects+1)&0xFF)) {
+					lba[0] = 1;
+					/* increment head */
+					if (((++drivehead)&0xF) == (heads&0xF)) {
+						drivehead &= 0xF0;
+						if (heads == 16) drivehead -= 0x10;
+						/* increment cylinder */
+						if (((++lba[1])&0xFF) == 0x00) {
+							if (((++lba[2])&0xFF) == 0x00) {
+								return false;
+							}
+						}
+					}
+
+				}
+			} while ((--count) != 0);
+		}
+
+		return true;
+	}
+};
+#endif //C_DBP_ENABLE_IDE_ATA
+
 static void IDE_DelayedCommand(Bitu dev_idx/*which IDE device*/) {
 	IDEDevice *dev = IDEDevice::GetByIndex(dev_idx);
 	if (dev == NULL) return;
@@ -3032,602 +3632,5 @@ void DBPSerialize_IDE(DBPArchive& ar_outer)
 	}
 }
 
-#ifdef C_DBP_ENABLE_IDE_ATA // Disabled ATA drive support because BIOS access covers most cases
-static inline bool is_power_of_2(Bitu val) {
-	return (val != 0) && ((val&(val-1)) == 0);
-}
-
-struct IDEATADevice : public IDEDevice {
-	Bitu multiple_sector_max,multiple_sector_count;
-	Bitu heads,sects,cyls,headshr,progress_count;
-	Bitu phys_heads,phys_sects,phys_cyls;
-	Bitu sector_i,sector_total;
-	unsigned char sector[512 * 128];
-	Bit8u bios_disk_index;
-	bool geo_translate;
-
-	IDEATADevice(IDEController *c, Bit8u device_index, Bit8u bios_index)
-		: IDEDevice(c, device_index, IDE_TYPE_HDD) {
-		DBP_ASSERT(bios_index < MAX_DISK_IMAGES);
-		bios_disk_index = bios_index;
-		sector_i = sector_total = 0;
-		headshr = 0;
-		memset(sector, 0, sizeof(sector));
-		multiple_sector_max = sizeof(sector) / 512;
-		multiple_sector_count = 1;
-		geo_translate = false;
-		heads = 0;
-		sects = 0;
-		cyls = 0;
-		progress_count = 0;
-		phys_heads = 0;
-		phys_sects = 0;
-		phys_cyls = 0;
-		update_from_biosdisk();
-	}
-
-	inline imageDisk *getBIOSdisk() {
-		return imageDiskList[bios_disk_index];
-	}
-
-	virtual void writecommand(uint8_t cmd) {
-		if (!command_interruption_ok(cmd))
-			return;
-
-		/* if the drive is asleep, then writing a command wakes it up */
-		interface_wakeup();
-
-		/* FIXME: OAKCDROM.SYS is sending the hard disk command 0xA0 (ATAPI packet) for some reason. Why? */
-
-		/* drive is ready to accept command */
-		allow_writing = false;
-		command = cmd;
-		switch (cmd) {
-			case 0x00: /* NOP */
-				feature = 0x04;
-				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_ERROR;
-				raise_irq();
-				allow_writing = true;
-				break;
-			case 0x08: /* DEVICE RESET */
-				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
-				drivehead &= 0x10;
-				count = 0x01; lba[0] = 0x01; feature = 0x00;
-				lba[1] = lba[2] = 0;
-				/* NTS: Testing suggests that ATA hard drives DO fire an IRQ at this stage.
-						In fact, Windows 95 won't detect hard drives that don't fire an IRQ in desponse */
-				raise_irq();
-				allow_writing = true;
-				break;
-			case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: case 0x17: /* RECALIBRATE (1xh) */
-			case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D: case 0x1E: case 0x1F:
-				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
-				/* "if the command is executed in CHS mode, then ... sector number register shall be 1.
-				 *  if executed in LAB mode, then ... sector number register shall be 0" */
-				if (drivehead_is_lba(drivehead)) lba[0] = 0x00;
-				else lba[0] = 0x01;
-				drivehead &= 0x10;
-				lba[1] = lba[2] = 0;
-				feature = 0x00;
-				raise_irq();
-				allow_writing = true;
-				break;
-			case 0x20: /* READ SECTOR */
-				progress_count = 0;
-				state = IDE_DEV_BUSY;
-				status = IDE_STATUS_BUSY;
-				PIC_RemoveSpecificEvents(IDE_DelayedCommand,device_index);
-				PIC_AddEvent(IDE_DelayedCommand,(0.1f)/*ms*/,device_index);
-				break;
-			case 0x30: /* WRITE SECTOR */
-				/* the drive does NOT signal an interrupt. it sets DRQ and waits for a sector
-				 * to be transferred to it before executing the command */
-				progress_count = 0;
-				state = IDE_DEV_DATA_WRITE;
-				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRQ;
-				prepare_write(0,512);
-				break;
-			case 0x40: /* READ SECTOR VERIFY WITH RETRY */
-			case 0x41: /* READ SECTOR VERIFY WITHOUT RETRY */
-				progress_count = 0;
-				state = IDE_DEV_BUSY;
-				status = IDE_STATUS_BUSY;
-				PIC_RemoveSpecificEvents(IDE_DelayedCommand,device_index);
-				PIC_AddEvent(IDE_DelayedCommand,(0.1f)/*ms*/,device_index);
-				break;
-			case 0x91: /* INITIALIZE DEVICE PARAMETERS */
-				if ((unsigned int)count != (unsigned int)sects || (unsigned int)((drivehead&0xF)+1) != (unsigned int)heads) {
-					if (count == 0) {
-						LOG_MSG("IDE warning: OS attempted to change geometry to invalid H/S %u/%u",
-							count,(drivehead&0xF)+1);
-						abort_error();
-						allow_writing = true;
-						return;
-					}
-					else {
-						unsigned int ncyls;
-
-						ncyls = (unsigned int)(phys_cyls * phys_heads * phys_sects);
-						ncyls += (count * ((unsigned int)(drivehead&0xF)+1u)) - 1u;
-						ncyls /= count * ((unsigned int)(drivehead&0xF)+1u);
-
-						/* the OS is changing logical disk geometry, so update our head/sector count (needed for Windows ME) */
-						LOG_MSG("IDE warning: OS is changing logical geometry from C/H/S %u/%u/%u to logical H/S %u/%u/%u",
-							(int)cyls,(int)heads,(int)sects,
-							(int)ncyls,(int)((drivehead&0xF)+1),(int)count);
-						LOG_MSG("             Compatibility issues may occur if the OS tries to use INT 13 at the same time!");
-
-						cyls = ncyls;
-						sects = count;
-						heads = (drivehead&0xFu)+1u;
-					}
-				}
-
-				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
-				allow_writing = true;
-				raise_irq(); // NTS: The Linux kernel will pause for up to 30 seconds waiting for this command to issue an IRQ if we don't do this
-				break;
-			case 0xC4: /* READ MULTIPLE */
-				progress_count = 0;
-				state = IDE_DEV_BUSY;
-				status = IDE_STATUS_BUSY;
-				PIC_RemoveSpecificEvents(IDE_DelayedCommand,device_index);
-				PIC_AddEvent(IDE_DelayedCommand,(0.1f)/*ms*/,device_index);
-				break;
-			case 0xC5: /* WRITE MULTIPLE */
-				/* the drive does NOT signal an interrupt. it sets DRQ and waits for a sector
-				 * to be transferred to it before executing the command */
-				progress_count = 0;
-				state = IDE_DEV_DATA_WRITE;
-				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRQ;
-				prepare_write(0UL,512UL*IDEMIN((unsigned long)multiple_sector_count,(unsigned long)(count == 0 ? 256 : count)));
-				break;
-			case 0xC6: /* SET MULTIPLE MODE */
-				/* only sector counts 1, 2, 4, 8, 16, 32, 64, and 128 are legal by standard.
-				 * NTS: There's a bug in VirtualBox that makes 0 legal too! */
-				if (count != 0 && count <= multiple_sector_max && is_power_of_2(count)) {
-					multiple_sector_count = count;
-					status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
-				}
-				else {
-					feature = 0x04; /* abort error */
-					abort_error();
-				}
-				raise_irq();
-				allow_writing = true;
-				break;
-			case 0xA0:/*ATAPI PACKET*/
-				/* We're not an ATAPI packet device!
-				 * Windows 95 seems to issue this at startup to hard drives. Duh. */
-				/* fall through */
-			case 0xA1: /* IDENTIFY PACKET DEVICE */
-				/* We are not an ATAPI packet device.
-				 * Most MS-DOS drivers and Windows 95 like to issue both IDENTIFY ATA and IDENTIFY ATAPI commands.
-				 * I also gather from some contributors on the github comments that people think our "Unknown IDE/ATA command"
-				 * error message is part of some other error in the emulation. Rather than put up with that, we'll just
-				 * silently abort the command with an error. */
-				abort_normal();
-				status = IDE_STATUS_ERROR|IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE|0x20/*write fault*/;
-				drivehead &= 0x30;
-				count = 0x01;
-				lba[0] = 0x01;
-				feature = 0x04; /* abort */
-				lba[1] = 0x00;
-				lba[2] = 0x00;
-				raise_irq();
-				allow_writing = true;
-				break;
-			case 0xE7: /* FLUSH CACHE */
-				/* NTS: Windows 2000 and Windows XP like this command a lot. They REALLY REALLY like
-				 *      to issue this command a lot, especially during the install phase. This is
-				 *      here to avoid filling your log file with many repetitions of
-				 *      "Unknown IDE/ATA command E7" */
-				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
-				state = IDE_DEV_READY;
-				allow_writing = true;
-				raise_irq();
-				break;
-			case 0xEC: /* IDENTIFY DEVICE */
-				state = IDE_DEV_BUSY;
-				status = IDE_STATUS_BUSY;
-				PIC_RemoveSpecificEvents(IDE_DelayedCommand,device_index);
-				PIC_AddEvent(IDE_DelayedCommand,(ide_identify_command_delay),device_index);
-				break;
-			case 0xEF: /* SET FEATURES */
-				if (feature == 0x66/*Disable reverting to power on defaults*/ ||
-					feature == 0xCC/*Enable reverting to power on defaults*/) {
-					/* ignore */
-					status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
-					state = IDE_DEV_READY;
-				}
-				else {
-					LOG_MSG("SET FEATURES %02xh SC=%02x SN=%02x CL=%02x CH=%02x",feature,count,lba[0],lba[1],lba[2]);
-					abort_error();
-				}
-				allow_writing = true;
-				raise_irq();
-				break;
-			default:
-				LOG_MSG("Unknown IDE/ATA command %02X",cmd);
-				abort_error();
-				allow_writing = true;
-				raise_irq();
-				break;
-		}
-	}
-
-	virtual Bitu data_read(Bitu iolen) { /* read from 1F0h data port from IDE device */
-		Bitu w = ~0u;
-
-		if (state != IDE_DEV_DATA_READ)
-			return 0xFFFFUL;
-
-		if (!(status & IDE_STATUS_DRQ)) {
-			LOG_MSG("IDE: Data read when DRQ=0");
-			return 0xFFFFUL;
-		}
-
-		if ((sector_i+iolen) > sector_total) {
-			LOG_MSG("ide ata warning: sector already read %lu / %lu",(unsigned long)sector_i,(unsigned long)sector_total);
-			return 0xFFFFUL;
-		}
-
-		if (iolen >= 4) {
-			w = host_readd(sector+sector_i);
-			sector_i += 4;
-		}
-		else if (iolen >= 2) {
-			w = host_readw(sector+sector_i);
-			sector_i += 2;
-		}
-		/* NTS: Some MS-DOS CD-ROM drivers like OAKCDROM.SYS use byte-wide I/O for the initial identification */
-		else if (iolen == 1) {
-			w = sector[sector_i++];
-		}
-
-		if (sector_i >= sector_total)
-			io_completion();
-
-		return w;
-	}
-
-	virtual void data_write(Bitu v,Bitu iolen) { /* write to 1F0h data port to IDE device */
-		if (state != IDE_DEV_DATA_WRITE) {
-			LOG_MSG("ide ata warning: data write when device not in data_write state");
-			return;
-		}
-		if (!(status & IDE_STATUS_DRQ)) {
-			LOG_MSG("ide ata warning: data write with drq=0");
-			return;
-		}
-		if ((sector_i+iolen) > sector_total) {
-			LOG_MSG("ide ata warning: sector already full %lu / %lu",(unsigned long)sector_i,(unsigned long)sector_total);
-			return;
-		}
-
-		if (iolen >= 4) {
-			host_writed(sector+sector_i,(Bit32u)v);
-			sector_i += 4;
-		}
-		else if (iolen >= 2) {
-			host_writew(sector+sector_i,(Bit32u)v);
-			sector_i += 2;
-		}
-		else if (iolen == 1) {
-			sector[sector_i++] = (unsigned char)v;
-		}
-
-		if (sector_i >= sector_total)
-			io_completion();
-	}
-
-	void update_from_biosdisk() {
-		imageDisk *dsk = getBIOSdisk();
-		if (dsk == NULL) {
-			LOG_MSG("WARNING: IDE update from BIOS disk failed, disk not available");
-			return;
-		}
-
-		headshr = 0;
-		geo_translate = false;
-		cyls = dsk->cylinders;
-		heads = dsk->heads;
-		sects = dsk->sectors;
-
-		/* One additional correction: The disk image is probably using BIOS-style geometry
-		   translation (such as C/H/S 1024/64/63) which is impossible given that the IDE
-		   standard only allows up to 16 heads. So we have to translate the geometry. */
-		while (heads > 16 && (heads & 1) == 0) {
-			cyls <<= 1U;
-			heads >>= 1U;
-			headshr++;
-		}
-
-		/* If we can't divide the heads down, then pick a LBA-like mapping that is good enough.
-		 * Note that if what we pick does not evenly map to the INT 13h geometry, and the partition
-		 * contained within is not an LBA type FAT16/FAT32 partition, then Windows 95's IDE driver
-		 * will ignore this device and fall back to using INT 13h. For user convenience we will
-		 * print a warning to reminder the user of exactly that. */
-		if (heads > 16) {
-			unsigned long tmp;
-
-			geo_translate = true;
-
-			tmp = (unsigned long)(heads * cyls * sects);
-			sects = 63;
-			heads = 16;
-			cyls = (tmp + ((63 * 16) - 1)) / (63 * 16);
-			LOG_MSG("WARNING: Unable to reduce heads to 16 and below");
-			LOG_MSG("If at all possible, please consider using INT 13h geometry with a head");
-			LOG_MSG("count that is easier to map to the BIOS, like 240 heads or 128 heads/track.");
-			LOG_MSG("Some OSes, such as Windows 95, will not enable their 32-bit IDE driver if");
-			LOG_MSG("a clean mapping does not exist between IDE and BIOS geometry.");
-			LOG_MSG("Mapping BIOS DISK C/H/S %u/%u/%u as IDE %u/%u/%u (non-straightforward mapping)",
-				(unsigned int)dsk->cylinders,
-				(unsigned int)dsk->heads,
-				(unsigned int)dsk->sectors,
-				(unsigned int)cyls,
-				(unsigned int)heads,
-				(unsigned int)sects);
-		}
-		else {
-			LOG_MSG("Mapping BIOS DISK C/H/S %u/%u/%u as IDE %u/%u/%u",
-				(unsigned int)dsk->cylinders,
-				(unsigned int)dsk->heads,
-				(unsigned int)dsk->sectors,
-				(unsigned int)cyls,
-				(unsigned int)heads,
-				(unsigned int)sects);
-		}
-
-		phys_heads = heads;
-		phys_sects = sects;
-		phys_cyls = cyls;
-	}
-
-	void generate_identify_device() {
-		//imageDisk *disk = getBIOSdisk();
-		unsigned char csum;
-		uint64_t ptotal;
-		uint64_t total;
-		Bitu i;
-
-		/* IN RESPONSE TO IDENTIFY DEVICE (0xEC)
-		   GENERATE 512-BYTE REPLY */
-		memset(sector,0,512);
-
-		/* total disk capacity in sectors */
-		total = sects * cyls * heads;
-		ptotal = phys_sects * phys_cyls * phys_heads;
-
-		host_writew(sector+(0*2),0x0040);   /* bit 6: 1=fixed disk */
-		host_writew(sector+(1*2),(Bit16u)phys_cyls);
-		host_writew(sector+(3*2),(Bit16u)phys_heads);
-		host_writew(sector+(4*2),(Bit16u)phys_sects * 512); /* unformatted bytes per track */
-		host_writew(sector+(5*2),512);      /* unformatted bytes per sector */
-		host_writew(sector+(6*2),(Bit16u)phys_sects);
-
-		host_writew(sector+(20*2),1);       /* ATA-1: single-ported single sector buffer */
-		host_writew(sector+(21*2),4);       /* ATA-1: ECC bytes on read/write long */
-
-		// These strings are encoded with a 2 byte invert pattern (1234 becomes 2143)
-		memcpy(sector+(10*2), "0868",                4); memset(sector+(10*2)+ 4, ' ',  20- 4); //id_serial "8086", 20 bytes, padded with space
-		memcpy(sector+(23*2), "0868",                4); memset(sector+(23*2)+ 4, ' ',   8- 4); //id_firmware_rev "8086", 8 bytes, padded with space
-		memcpy(sector+(27*2), "ODBSxoX-I EDd si k", 18); memset(sector+(27*2)+18, ' ',  40-18); //id_model "DOSBox-X IDE disk", 40 bytes, padded with space
-
-		if (multiple_sector_max != 0)
-			host_writew(sector+(47*2),(Bit16u)(0x80|multiple_sector_max)); /* <- READ/WRITE MULTIPLE MAX SECTORS */
-
-		host_writew(sector+(48*2),0x0000);  /* :0  0=we do not support doubleword (32-bit) PIO */
-		host_writew(sector+(49*2),0x0A00);  /* :13 0=Standby timer values managed by device */
-							/* :11 1=IORDY supported */
-							/* :10 0=IORDY not disabled */
-							/* :9  1=LBA supported */
-							/* :8  0=DMA not supported */
-		host_writew(sector+(50*2),0x4000);  /* FIXME: ??? */
-		host_writew(sector+(51*2),0x00F0);  /* PIO data transfer cycle timing mode */
-		host_writew(sector+(52*2),0x00F0);  /* DMA data transfer cycle timing mode */
-		host_writew(sector+(53*2),0x0007);  /* :2  1=the fields in word 88 are valid */
-							/* :1  1=the fields in word (70:64) are valid */
-							/* :0  1= ??? */
-		host_writew(sector+(54*2),(Bit16u)cyls);    /* current cylinders */
-		host_writew(sector+(55*2),(Bit16u)heads);   /* current heads */
-		host_writew(sector+(56*2),(Bit16u)sects);   /* current sectors per track */
-		host_writed(sector+(57*2),(Bit32u)total);   /* current capacity in sectors */
-
-		if (multiple_sector_count != 0)
-			host_writew(sector+(59*2),(Bit16u)(0x0100|multiple_sector_count)); /* :8  multiple sector setting is valid */
-							/* 7:0 current setting for number of log. sectors per DRQ of READ/WRITE MULTIPLE */
-
-		host_writed(sector+(60*2),(Bit32u)ptotal);  /* total user addressable sectors (LBA) */
-		host_writew(sector+(62*2),0x0000);  /* FIXME: ??? */
-		host_writew(sector+(63*2),0x0000);  /* :10 0=Multiword DMA mode 2 not selected */
-							/* TODO: Basically, we don't do DMA. Fill out this comment */
-		host_writew(sector+(64*2),0x0003);  /* 7:0 PIO modes supported (FIXME ???) */
-		host_writew(sector+(65*2),0x0000);  /* FIXME: ??? */
-		host_writew(sector+(66*2),0x0000);  /* FIXME: ??? */
-		host_writew(sector+(67*2),0x0078);  /* FIXME: ??? */
-		host_writew(sector+(68*2),0x0078);  /* FIXME: ??? */
-		host_writew(sector+(80*2),0x007E);  /* major version number. Here we say we support ATA-1 through ATA-8 */
-		host_writew(sector+(81*2),0x0022);  /* minor version */
-		host_writew(sector+(82*2),0x4208);  /* command set: NOP, DEVICE RESET[XXXXX], POWER MANAGEMENT */
-		host_writew(sector+(83*2),0x4000);  /* command set: LBA48[XXXX] */
-		host_writew(sector+(84*2),0x4000);  /* FIXME: ??? */
-		host_writew(sector+(85*2),0x4208);  /* commands in 82 enabled */
-		host_writew(sector+(86*2),0x4000);  /* commands in 83 enabled */
-		host_writew(sector+(87*2),0x4000);  /* FIXME: ??? */
-		host_writew(sector+(88*2),0x0000);  /* FIXME: ??? */
-		host_writew(sector+(93*3),0x0000);  /* FIXME: ??? */
-
-		/* ATA-8 integrity checksum */
-		sector[510] = 0xA5;
-		csum = 0; for (i=0;i < 511;i++) csum += sector[i];
-		sector[511] = 0 - csum;
-	}
-
-	void prepare_read(Bitu offset,Bitu size) {
-		/* I/O must be WORD ALIGNED */
-		DBP_ASSERT((offset&1) == 0);
-		//assert((size&1) == 0);
-
-		sector_i = offset;
-		sector_total = size;
-		DBP_ASSERT(sector_i <= sector_total);
-		DBP_ASSERT(sector_total <= sizeof(sector));
-	}
-
-	void prepare_write(Bitu offset,Bitu size) {
-		/* I/O must be WORD ALIGNED */
-		DBP_ASSERT((offset&1) == 0);
-		//assert((size&1) == 0);
-
-		sector_i = offset;
-		sector_total = size;
-		DBP_ASSERT(sector_i <= sector_total);
-		DBP_ASSERT(sector_total <= sizeof(sector));
-	}
-
-	void io_completion() {
-		/* lower DRQ */
-		status &= ~IDE_STATUS_DRQ;
-
-		/* depending on the command, either continue it or finish up */
-		switch (command) {
-			case 0x20:/* READ SECTOR */
-				/* OK, decrement count, increment address */
-				/* NTS: Remember that count == 0 means the host wanted to transfer 256 sectors */
-				progress_count++;
-				if ((count&0xFF) == 1) {
-					/* end of the transfer */
-					count = 0;
-					status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
-					state = IDE_DEV_READY;
-					allow_writing = true;
-					return;
-				}
-				else if ((count&0xFF) == 0) count = 255;
-				else count--;
-
-				if (!increment_current_address()) {
-					LOG_MSG("READ advance error");
-					abort_error();
-					return;
-				}
-
-				/* cause another delay, another sector read */
-				state = IDE_DEV_BUSY;
-				status = IDE_STATUS_BUSY;
-				PIC_RemoveSpecificEvents(IDE_DelayedCommand,device_index);
-				PIC_AddEvent(IDE_DelayedCommand,0.00001f/*ms*/,device_index);
-				break;
-			case 0x30:/* WRITE SECTOR */
-				/* this is where the drive has accepted the sector, lowers DRQ, and begins executing the command */
-				state = IDE_DEV_BUSY;
-				status = IDE_STATUS_BUSY;
-				PIC_RemoveSpecificEvents(IDE_DelayedCommand,device_index);
-				PIC_AddEvent(IDE_DelayedCommand,((progress_count == 0) ? 0.1f : 0.00001f)/*ms*/,device_index);
-				break;
-			case 0xC4:/* READ MULTIPLE */
-				/* OK, decrement count, increment address */
-				/* NTS: Remember that count == 0 means the host wanted to transfer 256 sectors */
-				for (unsigned int cc=0;cc < multiple_sector_count;cc++) {
-					progress_count++;
-					if ((count&0xFF) == 1) {
-						/* end of the transfer */
-						count = 0;
-						status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
-						state = IDE_DEV_READY;
-						allow_writing = true;
-						return;
-					}
-					else if ((count&0xFF) == 0) count = 255;
-					else count--;
-
-					if (!increment_current_address()) {
-						LOG_MSG("READ advance error");
-						abort_error();
-						return;
-					}
-				}
-
-				/* cause another delay, another sector read */
-				state = IDE_DEV_BUSY;
-				status = IDE_STATUS_BUSY;
-				PIC_RemoveSpecificEvents(IDE_DelayedCommand,device_index);
-				PIC_AddEvent(IDE_DelayedCommand,0.00001f/*ms*/,device_index);
-				break;
-			case 0xC5:/* WRITE MULTIPLE */
-				/* this is where the drive has accepted the sector, lowers DRQ, and begins executing the command */
-				state = IDE_DEV_BUSY;
-				status = IDE_STATUS_BUSY;
-				PIC_RemoveSpecificEvents(IDE_DelayedCommand,device_index);
-				PIC_AddEvent(IDE_DelayedCommand,((progress_count == 0) ? 0.1f : 0.00001f)/*ms*/,device_index);
-				break;
-			default: /* most commands: signal drive ready, return to ready state */
-				/* NTS: Some MS-DOS CD-ROM drivers will loop endlessly if we never set "drive seek complete"
-						because they like to hit the device with DEVICE RESET (08h) whether or not it's
-					a hard disk or CD-ROM drive */
-				count = 0;
-				drivehead &= 0xF0;
-				lba[0] = 0;
-				lba[1] = lba[2] = 0;
-				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
-				state = IDE_DEV_READY;
-				allow_writing = true;
-				break;
-		}
-	}
-
-	bool increment_current_address(Bitu count=1) {
-		if (count == 0) return false;
-
-		if (drivehead_is_lba(drivehead)) {
-			/* 28-bit LBA:
-			 *    drivehead: 27:24
-			 *    lba[2]:    23:16
-			 *    lba[1]:    15:8
-			 *    lba[0]:    7:0 */
-			do {
-				if (((++lba[0])&0xFF) == 0x00) {
-					lba[0] = 0x00;
-					if (((++lba[1])&0xFF) == 0x00) {
-						lba[1] = 0x00;
-						if (((++lba[2])&0xFF) == 0x00) {
-							lba[2] = 0x00;
-							if (((++drivehead)&0xF) == 0) {
-								drivehead -= 0x10;
-								return false;
-							}
-						}
-					}
-				}
-			} while ((--count) != 0);
-		}
-		else {
-			/* C/H/S increment with rollover */
-			do {
-				/* increment sector */
-				if (((++lba[0])&0xFF) == ((sects+1)&0xFF)) {
-					lba[0] = 1;
-					/* increment head */
-					if (((++drivehead)&0xF) == (heads&0xF)) {
-						drivehead &= 0xF0;
-						if (heads == 16) drivehead -= 0x10;
-						/* increment cylinder */
-						if (((++lba[1])&0xFF) == 0x00) {
-							if (((++lba[2])&0xFF) == 0x00) {
-								return false;
-							}
-						}
-					}
-
-				}
-			} while ((--count) != 0);
-		}
-
-		return true;
-	}
-};
-#endif //C_DBP_ENABLE_IDE_ATA
 
 #endif //C_DBP_ENABLE_IDE
