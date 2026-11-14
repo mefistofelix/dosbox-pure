@@ -1746,7 +1746,7 @@ struct NE2K
 				// Generate an interrupt if not masked and not one in progress
 				if (s.IMR.tx_inte && !s.ISR.pkt_tx) {
 					//LOG_MSG("tx complete interrupt");
-					PIC_ActivateIRQ((unsigned int)s.base_irq);
+					PIC_ActivateIRQ(pick_irq());
 				}
 				s.ISR.pkt_tx = 1;
 			}
@@ -1875,7 +1875,7 @@ struct NE2K
 		if (s.CR.rdma_cmd == 0x01 && s.CR.start && s.remote_bytes == 0) {
 			s.ISR.rdma_done = 1;
 			if (s.IMR.rdma_inte) {
-				PIC_ActivateIRQ((unsigned int)s.base_irq);
+				PIC_ActivateIRQ(pick_irq());
 			}
 		}
 	}
@@ -1968,7 +1968,7 @@ struct NE2K
 				if (s.remote_bytes == 0) {
 					s.ISR.rdma_done = 1;
 					if (s.IMR.rdma_inte) {
-						PIC_ActivateIRQ((unsigned int)s.base_irq);
+						PIC_ActivateIRQ(pick_irq());
 					}
 				}
 				break;
@@ -2012,7 +2012,7 @@ struct NE2K
 				if (s.remote_bytes == 0) {
 					s.ISR.rdma_done = 1;
 					if (s.IMR.rdma_inte) {
-						PIC_ActivateIRQ((unsigned int)s.base_irq);
+						PIC_ActivateIRQ(pick_irq());
 					}
 				}
 				break;
@@ -2292,7 +2292,7 @@ struct NE2K
 				s.IMR.rdma_inte  = ((value & 0x40) == 0x40);
 				if(s.ISR.pkt_tx &&s.IMR.tx_inte) {
 					LOG_MSG("tx irq retrigger");
-					PIC_ActivateIRQ((unsigned int)s.base_irq);
+					PIC_ActivateIRQ(pick_irq());
 				}
 				break;
 
@@ -2506,7 +2506,7 @@ struct NE2K
 		// Generate an interrupt if not masked and not one in progress
 		if (s.IMR.tx_inte && !s.ISR.pkt_tx) {
 			//LOG_MSG("tx complete interrupt");
-			PIC_ActivateIRQ((unsigned int)s.base_irq);
+			PIC_ActivateIRQ(pick_irq());
 		} //else LOG_MSG("no tx complete interrupt");
 		s.ISR.pkt_tx = 1;
 		s.tx_timer_active = 0;
@@ -2622,7 +2622,7 @@ struct NE2K
 
 		if (s.IMR.rx_inte) {
 			//LOG_MSG("packet rx interrupt");
-			PIC_ActivateIRQ((unsigned int)s.base_irq);
+			PIC_ActivateIRQ(pick_irq());
 		} //else LOG_MSG("no packet rx interrupt");
 	}
 
@@ -2718,6 +2718,24 @@ struct NE2K
 	{
 		(void)val;//UNUSED
 		self->tx_timer();
+	}
+
+	// RetroFire, with the internet option: the card has no register that tells it its interrupt
+	// line, and Windows 95 detects its port (0x300) but not its IRQ, then gives the driver any
+	// free one. So the card interrupts on the line the guest's driver is listening on: 10 when
+	// it is unmasked, else the first unmasked line a NE2000 can be given and no other emulated
+	// device uses.
+	unsigned int pick_irq()
+	{
+		if (dbp_net_internet)
+		{
+			extern Bit16u PIC_GetUnmaskedIRQs(void);
+			const Bit16u open = PIC_GetUnmaskedIRQs();
+			static const Bit8u lines[] = { 10, 11, 5, 9, 3, 15 };
+			for (Bit8u irq : lines)
+				if (open & (1 << irq)) { s.base_irq = irq; break; }
+		}
+		return (unsigned int)s.base_irq;
 	}
 
 	static void nat_rx(const Bit8u* frame, Bit32u len)

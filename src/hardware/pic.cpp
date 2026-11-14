@@ -285,6 +285,11 @@ static Bitu read_data(Bitu port,Bitu /*iolen*/) {
 	return pic->imr;
 }
 
+// RetroFire: bit n set = IRQ n is not masked (a driver in the guest is listening on it)
+Bit16u PIC_GetUnmaskedIRQs(void) {
+	return (Bit16u)~((Bit16u)pics[0].imr | ((Bit16u)pics[1].imr << 8));
+}
+
 void PIC_ActivateIRQ(Bitu irq) {
 	Bitu t = irq>7 ? (irq - 8): irq;
 	PIC_Controller * pic=&pics[irq>7 ? 1 : 0];
