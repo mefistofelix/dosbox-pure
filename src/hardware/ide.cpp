@@ -51,6 +51,12 @@ static const unsigned short IDE_default_alts[4] = {
 	0x36E, /* quaternary */
 };
 
+// RetroFire: the ATA hard disk emulation is compiled in again. It is used only with the core
+// option "dosbox_pure_ide_hdd": operating systems that talk to the IDE controller themselves
+// instead of using the BIOS (Linux) need it to see the disk.
+#define C_DBP_ENABLE_IDE_ATA 1
+bool dbp_ide_hdd;
+
 enum IDEDeviceType : uint8_t {
 	IDE_TYPE_NONE,
 #ifdef C_DBP_ENABLE_IDE_ATA
@@ -2986,10 +2992,10 @@ void IDE_SetupControllers(bool alwaysHaveCDROM)
 	{
 		IDEController* c = idecontroller[i>>1];
 		#ifdef C_DBP_ENABLE_IDE_ATA
-		if (imageDiskList[i+2])
+		if (imageDiskList[i+2] && dbp_ide_hdd)
 			c->device[i&1] = new IDEATADevice(c, i, i+2);
 		#endif
-		if (!imageDiskList[i+2] && numCDROMDevices && numCDROMDevices--)
+		if (!(imageDiskList[i+2] && dbp_ide_hdd) && numCDROMDevices && numCDROMDevices--)
 			c->device[i&1] = new IDEATAPICDROMDevice(c, i);
 	}
 

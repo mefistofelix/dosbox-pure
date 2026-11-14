@@ -106,6 +106,7 @@ namespace DBP_Option
 		memory_size,
 		modem,
 		internet,
+		ide_hdd,
 		cpu_type,
 		cpu_core,
 		bootos_ramdisk,
@@ -900,6 +901,18 @@ static retro_core_option_v2_definition option_defs[DBP_Option::_OPTIONS_TOTAL] =
 		"Internet Access for the Network Card", NULL,
 		"Connect the emulated NE2000 network card (port 0x300, IRQ 10) of a booted operating system to the internet through this device." "\n"
 		"The system gets its address by DHCP (10.0.2.15, router 10.0.2.2, name server 10.0.2.3). Not used during netplay.", NULL,
+		DBP_OptionCat::System,
+		{
+			{ "false", "Off (default)" },
+			{ "true", "On" },
+		},
+		"false"
+	},
+	{
+		"dosbox_pure_ide_hdd",
+		"Hard Disk on the IDE Controller (restart required)", NULL,
+		"Also offer the hard disk of a booted operating system on the emulated IDE controller, not only through the BIOS." "\n"
+		"Needed by systems that drive the disk themselves, like Linux. Leave it off for DOS and Windows.", NULL,
 		DBP_OptionCat::System,
 		{
 			{ "false", "Off (default)" },

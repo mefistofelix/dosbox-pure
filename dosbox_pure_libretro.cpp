@@ -2430,6 +2430,8 @@ static bool check_variables()
 
 	extern bool dbp_net_internet;
 	dbp_net_internet = (DBP_Option::Get(DBP_Option::internet)[0] == 't');
+	extern bool dbp_ide_hdd;
+	dbp_ide_hdd = (DBP_Option::Get(DBP_Option::ide_hdd)[0] == 't');
 
 	DBP_Option::SetDisplay(DBP_Option::modem, dbp_use_network);
 	if (dbp_use_network)
